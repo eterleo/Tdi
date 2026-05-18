@@ -1,19 +1,15 @@
 /**
  * TradingView Desktop CDP connection via ngrok tunnel.
  *
- * ── REQUIRED SETUP ──────────────────────────────────────────────────────────
- * Chrome's CDP server only accepts requests with Host: localhost/127.0.0.1.
- * ngrok's edge layer validates incoming Host matches its own domain, so you
- * cannot satisfy both with a plain HTTP tunnel.
+ * Server-side requirements:
+ *   ngrok:       --host-header="localhost:9222"
+ *   TradingView: --remote-allow-origins=https://clump-stunned-stank.ngrok-free.dev
  *
- * Fix — restart your tunnel with the host-header rewrite flag:
+ * We manually fetch /json with Host: localhost:9222 (matches ngrok's rewrite
+ * config) and Origin: <ngrok-url> (satisfies Chrome's allow-origins check),
+ * then pass the WebSocket URL directly to CRI to skip its internal fetch.
  *
- *   ngrok http 9222 --host-header="localhost:9222"
- *
- * ngrok will then accept the ngrok-domain Host (for its own routing) and
- * silently rewrite it to localhost:9222 before forwarding to Chrome.
- *
- * ── USAGE ───────────────────────────────────────────────────────────────────
+ * Usage:
  *   node connect.js            # status + chart symbol/timeframe
  *   node connect.js --backtest # also run the SMC+TDI v4 backtest
  */
@@ -21,69 +17,120 @@
 'use strict';
 
 const CDP   = require('chrome-remote-interface');
+const https = require('https');
 
 const NGROK_HOST    = 'clump-stunned-stank.ngrok-free.dev';
-const NGROK_HTTPS   = `https://${NGROK_HOST}`;
+const NGROK_URL     = `https://${NGROK_HOST}`;
+const NGROK_WSS     = `wss://${NGROK_HOST}`;
 const BACKTEST_PATH = 'C:\\Users\\Dell\\tradingview-mcp\\scripts\\backtest_smc_tdi_v4.js';
 const RUN_BACKTEST  = process.argv.includes('--backtest');
+
+// Headers sent on every request:
+//   Host   → matches ngrok's --host-header="localhost:9222" expectation
+//   Origin → satisfies Chrome's --remote-allow-origins check
+const REQUEST_HEADERS = {
+  'Host':                         'localhost:9222',
+  'Origin':                       NGROK_URL,
+  'ngrok-skip-browser-warning':   'true',
+  'User-Agent':                   'tradingview-mcp/1.0',
+};
+
+// ---------------------------------------------------------------------------
+// Fetch /json using Node's native https so Host can be overridden
+// ---------------------------------------------------------------------------
+function fetchJson(path) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: NGROK_HOST,
+        port:     443,
+        path,
+        method:  'GET',
+        headers: REQUEST_HEADERS,
+      },
+      (res) => {
+        let body = '';
+        res.on('data', (chunk) => (body += chunk));
+        res.on('end', () => {
+          if (res.statusCode !== 200) {
+            return reject(new Error(`HTTP ${res.statusCode}: ${body.trim()}`));
+          }
+          try { resolve(JSON.parse(body)); }
+          catch (e) { reject(new Error(`JSON parse error: ${body.slice(0, 200)}`)); }
+        });
+      }
+    );
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+/** Rewrite ws://127.0.0.1:9222/… → wss://<ngrok-host>/… */
+function rewriteWsUrl(localUrl) {
+  const u = new URL(localUrl);
+  return `${NGROK_WSS}${u.pathname}`;
+}
+
+/** Prefer a TradingView page; fall back to any page target. */
+function selectTarget(targets) {
+  return (
+    targets.find(t => t.type === 'page' && /tradingview/i.test(`${t.url}${t.title}`)) ||
+    targets.find(t => t.type === 'page') ||
+    targets[0]
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Connection
 // ---------------------------------------------------------------------------
 async function connectCDP() {
-  console.log(`Connecting to TradingView Desktop via CDP…`);
-  console.log(`  Endpoint : ${NGROK_HTTPS}`);
+  console.log('Connecting to TradingView Desktop via CDP…');
+  console.log(`  Endpoint: ${NGROK_URL}`);
 
-  let client;
+  // Step 1 — fetch target list with correct headers
+  let targets;
   try {
-    client = await CDP({
-      host:        NGROK_HOST,
-      port:        443,
-      secure:      true,
-      useHostName: true,
-      // Passed through to the WebSocket constructor (ws package).
-      // Also causes CRI to include them in the initial HTTP GET /json request.
-      headers: {
-        'ngrok-skip-browser-warning': 'true',
-        'User-Agent': 'tradingview-mcp/1.0',
-      },
-    });
+    targets = await fetchJson('/json');
   } catch (err) {
-    if (/host not in allowlist/i.test(err.message)) {
-      console.error(`
-ERROR: Chrome CDP rejected the connection — Host not in allowlist.
-
-  ngrok forwards the request with Host: ${NGROK_HOST}, but Chrome only
-  allows localhost / 127.0.0.1.  Restart your ngrok tunnel with:
-
-      ngrok http 9222 --host-header="localhost:9222"
-
-  That makes ngrok rewrite the Host header before forwarding to Chrome.
-`);
-    } else {
-      console.error(`\nCDP connection failed: ${err.message}`);
-    }
+    console.error(`\nFailed to fetch CDP targets: ${err.message}`);
     process.exit(1);
   }
 
-  return client;
+  if (!targets?.length) {
+    console.error('\nNo CDP targets found — is TradingView Desktop running?');
+    process.exit(1);
+  }
+
+  console.log(`\nFound ${targets.length} CDP target(s):`);
+  targets.forEach((t, i) => console.log(`  [${i}] ${t.type} — ${t.title || t.url}`));
+
+  const target = selectTarget(targets);
+  const wsUrl  = rewriteWsUrl(target.webSocketDebuggerUrl);
+  console.log(`\nConnecting to: ${target.title || target.url}`);
+  console.log(`  WebSocket: ${wsUrl}`);
+
+  // Step 2 — connect to CDP directly via the rewritten WebSocket URL
+  let client;
+  try {
+    client = await CDP({ target: wsUrl, headers: REQUEST_HEADERS });
+  } catch (err) {
+    console.error(`\nCDP WebSocket connection failed: ${err.message}`);
+    process.exit(1);
+  }
+
+  return { client, target };
 }
 
 // ---------------------------------------------------------------------------
 // Step 1 — connection status
 // ---------------------------------------------------------------------------
-async function checkConnection(client) {
+async function checkConnection(client, target) {
   const { Runtime } = client;
-  const target      = client._target;
-
   console.log('\n=== CONNECTION STATUS ===');
-  console.log(`  Endpoint    : ${NGROK_HTTPS}`);
-  if (target) {
-    console.log(`  Target type : ${target.type}`);
-    console.log(`  Target URL  : ${target.url}`);
-    console.log(`  Target title: ${target.title}`);
-  }
-
+  console.log(`  Endpoint    : ${NGROK_URL}`);
+  console.log(`  Target type : ${target.type}`);
+  console.log(`  Target URL  : ${target.url}`);
+  console.log(`  Target title: ${target.title}`);
   const ua = await evaluate(Runtime, 'navigator.userAgent');
   console.log(`  User-Agent  : ${ua}`);
   console.log('  Status      : CONNECTED ✓');
@@ -97,15 +144,12 @@ async function getChartInfo(Runtime) {
 
   const symbolScript = `(function() {
     try {
-      // Primary: tvWidget API (TradingView Desktop)
       if (window.tvWidget && typeof window.tvWidget.activeChart === 'function')
         return window.tvWidget.activeChart().symbol();
-      // Fallback: scan window for any chart widget
       const k = Object.keys(window).find(
         k => window[k] && typeof window[k].activeChart === 'function'
       );
       if (k) return window[k].activeChart().symbol();
-      // DOM fallback: legend title element
       const el = document.querySelector('[data-name="legend-source-title"]');
       return el ? el.textContent.trim() : null;
     } catch(e) { return 'ERROR: ' + e.message; }
@@ -195,14 +239,13 @@ async function evaluate(Runtime, expression, awaitPromise = false) {
 // Main
 // ---------------------------------------------------------------------------
 async function main() {
-  const client = await connectCDP();
+  const { client, target } = await connectCDP();
   const { Runtime } = client;
   await Runtime.enable();
 
   try {
-    await checkConnection(client);
+    await checkConnection(client, target);
     await getChartInfo(Runtime);
-
     if (RUN_BACKTEST) {
       await runBacktest(Runtime);
     } else {
