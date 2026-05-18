@@ -5,7 +5,8 @@
   "main": "connect.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node connect.js",
+    "start": "node proxy.js",
+    "connect": "node connect.js",
     "backtest": "node connect.js --backtest"
   },
   "dependencies": {
