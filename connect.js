@@ -1,13 +1,12 @@
 /**
  * TradingView Desktop CDP connection via ngrok tunnel.
  *
- * Server-side requirements:
- *   ngrok:       --host-header="localhost:9222"
- *   TradingView: --remote-allow-origins=https://clump-stunned-stank.ngrok-free.dev
+ * Requires proxy.js running on the Windows machine:
+ *   node proxy.js          # starts on port 3001, rewrites Host → localhost:9222
+ *   ngrok http 3001        # tunnel ngrok to the proxy, NOT directly to 9222
  *
- * We manually fetch /json with Host: localhost:9222 (matches ngrok's rewrite
- * config) and Origin: <ngrok-url> (satisfies Chrome's allow-origins check),
- * then pass the WebSocket URL directly to CRI to skip its internal fetch.
+ * The proxy handles the Host rewrite so Chrome's CDP allowlist check passes.
+ * No --host-header or --remote-allow-origins flags needed.
  *
  * Usage:
  *   node connect.js            # status + chart symbol/timeframe
@@ -25,29 +24,19 @@ const NGROK_WSS     = `wss://${NGROK_HOST}`;
 const BACKTEST_PATH = 'C:\\Users\\Dell\\tradingview-mcp\\scripts\\backtest_smc_tdi_v4.js';
 const RUN_BACKTEST  = process.argv.includes('--backtest');
 
-// Headers sent on every request:
-//   Host   → matches ngrok's --host-header="localhost:9222" expectation
-//   Origin → satisfies Chrome's --remote-allow-origins check
-const REQUEST_HEADERS = {
-  'Host':                         'localhost:9222',
-  'Origin':                       NGROK_URL,
-  'ngrok-skip-browser-warning':   'true',
-  'User-Agent':                   'tradingview-mcp/1.0',
+// Only the ngrok interstitial header is needed — proxy.js handles Host rewriting.
+const HEADERS = {
+  'ngrok-skip-browser-warning': 'true',
+  'User-Agent':                 'tradingview-mcp/1.0',
 };
 
 // ---------------------------------------------------------------------------
-// Fetch /json using Node's native https so Host can be overridden
+// Fetch /json using Node's native https module
 // ---------------------------------------------------------------------------
 function fetchJson(path) {
   return new Promise((resolve, reject) => {
     const req = https.request(
-      {
-        hostname: NGROK_HOST,
-        port:     443,
-        path,
-        method:  'GET',
-        headers: REQUEST_HEADERS,
-      },
+      { hostname: NGROK_HOST, port: 443, path, method: 'GET', headers: HEADERS },
       (res) => {
         let body = '';
         res.on('data', (chunk) => (body += chunk));
@@ -85,14 +74,15 @@ function selectTarget(targets) {
 // ---------------------------------------------------------------------------
 async function connectCDP() {
   console.log('Connecting to TradingView Desktop via CDP…');
-  console.log(`  Endpoint: ${NGROK_URL}`);
+  console.log(`  Endpoint: ${NGROK_URL}  →  proxy:3001  →  Chrome:9222`);
 
-  // Step 1 — fetch target list with correct headers
   let targets;
   try {
     targets = await fetchJson('/json');
   } catch (err) {
     console.error(`\nFailed to fetch CDP targets: ${err.message}`);
+    console.error('Make sure proxy.js is running on the Windows machine and');
+    console.error('ngrok is tunnelling to port 3001 (not 9222 directly).');
     process.exit(1);
   }
 
@@ -109,10 +99,9 @@ async function connectCDP() {
   console.log(`\nConnecting to: ${target.title || target.url}`);
   console.log(`  WebSocket: ${wsUrl}`);
 
-  // Step 2 — connect to CDP directly via the rewritten WebSocket URL
   let client;
   try {
-    client = await CDP({ target: wsUrl, headers: REQUEST_HEADERS });
+    client = await CDP({ target: wsUrl, headers: HEADERS });
   } catch (err) {
     console.error(`\nCDP WebSocket connection failed: ${err.message}`);
     process.exit(1);

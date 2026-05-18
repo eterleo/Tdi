@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "chrome-remote-interface": "^0.33.2",
+    "http-proxy": "^1.18.1",
     "node-fetch": "^2.7.0",
     "ws": "^8.20.1"
   }
