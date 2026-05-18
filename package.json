@@ -1,0 +1,16 @@
+{
+  "name": "tradingview-mcp",
+  "version": "1.0.0",
+  "description": "TradingView Desktop CDP connection via ngrok tunnel",
+  "main": "connect.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node connect.js",
+    "backtest": "node connect.js --backtest"
+  },
+  "dependencies": {
+    "chrome-remote-interface": "^0.33.2",
+    "node-fetch": "^2.7.0",
+    "ws": "^8.20.1"
+  }
+}
