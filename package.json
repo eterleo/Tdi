@@ -4,8 +4,13 @@
   "description": "TradingView Desktop CDP connection via ngrok tunnel",
   "main": "connect.js",
   "type": "commonjs",
+  "bin": {
+    "tv": "src/cli/index.js"
+  },
   "scripts": {
     "start": "node proxy.js",
+    "status": "node src/cli/index.js status",
+    "analyse": "node analyse.js",
     "connect": "node connect.js",
     "backtest": "node connect.js --backtest"
   },
