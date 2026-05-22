@@ -7,28 +7,27 @@
  *   • 5M     — TDI indicator added, screenshot
  *   • 15M    — TDI indicator added, screenshot
  *
- * Saves 12 screenshots (2 timeframes × 3 pairs × 2 SMC+TDI groups)
- * then prints a scalping briefing with entry zone, SL and TP per pair.
+ * Saves 12 screenshots then prints a scalping briefing with entry,
+ * SL and TP per pair.
  *
  * Usage:
  *   node analyse.js
+ *   node src/cli/index.js analyse
+ *   npm run analyse
  *
- * Prerequisites:
- *   proxy.js running on port 3001
- *   ngrok tunnelling https://clump-stunned-stank.ngrok-free.dev → port 3001
+ * Connects directly to localhost:9222 — no proxy or ngrok needed.
+ * Override with: CDP_HOST=x CDP_PORT=y node analyse.js
  */
 
 'use strict';
 
 const CDP  = require('chrome-remote-interface');
-const https = require('https');
 const fs   = require('fs');
 const path = require('path');
 
-const NGROK_HOST = 'clump-stunned-stank.ngrok-free.dev';
-const NGROK_WSS  = `wss://${NGROK_HOST}`;
-const HEADERS    = { 'ngrok-skip-browser-warning': 'true', 'User-Agent': 'tradingview-mcp/1.0' };
-const OUT_DIR    = path.join(__dirname, 'screenshots');
+const CDP_HOST = process.env.CDP_HOST || 'localhost';
+const CDP_PORT = parseInt(process.env.CDP_PORT || '9222', 10);
+const OUT_DIR  = path.join(__dirname, 'screenshots');
 
 const PAIRS = ['XAUUSD', 'USDJPY', 'EURUSD'];
 
@@ -41,34 +40,18 @@ const TDI_INDICATOR = {
 };
 
 // ---------------------------------------------------------------------------
-// CDP bootstrap (same pattern as connect.js)
+// CDP bootstrap — direct localhost connection, no proxy/ngrok needed
 // ---------------------------------------------------------------------------
-function fetchJson(urlPath) {
-  return new Promise((resolve, reject) => {
-    const req = https.request(
-      { hostname: NGROK_HOST, port: 443, path: urlPath, method: 'GET', headers: HEADERS },
-      res => {
-        let body = '';
-        res.on('data', c => (body += c));
-        res.on('end', () => {
-          if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}: ${body.trim()}`));
-          try { resolve(JSON.parse(body)); } catch (e) { reject(new Error('JSON parse: ' + body.slice(0, 120))); }
-        });
-      }
-    );
-    req.on('error', reject);
-    req.end();
-  });
-}
-
 async function connectCDP() {
-  const targets = await fetchJson('/json');
-  if (!targets?.length) throw new Error('No CDP targets — is TradingView running?');
-  const target = targets.find(t => t.type === 'page' && /tradingview/i.test(`${t.url}${t.title}`))
-               || targets.find(t => t.type === 'page')
-               || targets[0];
-  const wsUrl = NGROK_WSS + new URL(target.webSocketDebuggerUrl).pathname;
-  const client = await CDP({ target: wsUrl, headers: HEADERS });
+  let client;
+  try {
+    client = await CDP({ host: CDP_HOST, port: CDP_PORT });
+  } catch (err) {
+    throw new Error(
+      `Cannot connect to CDP at ${CDP_HOST}:${CDP_PORT} — ${err.message}\n` +
+      `Make sure TradingView Desktop is running with --remote-debugging-port=${CDP_PORT}`
+    );
+  }
   await Promise.all([
     client.Runtime.enable(),
     client.Page.enable(),
