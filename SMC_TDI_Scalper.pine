@@ -1,0 +1,285 @@
+//@version=5
+indicator("SMC + TDI Scalper", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// TDI Settings
+rsi_period  = input.int(13,       "RSI Period",     minval=1,   group="TDI Settings")
+bb_period   = input.int(34,       "BB Period",      minval=2,   group="TDI Settings")
+bb_dev      = input.float(1.6185, "BB Deviation",   minval=0.1, group="TDI Settings")
+fast_period = input.int(2,        "Fast MA Period", minval=1,   group="TDI Settings")
+slow_period = input.int(7,        "Slow MA Period", minval=1,   group="TDI Settings")
+
+// Market Structure Settings
+swing_len = input.int(10, "Swing Lookback", minval=2, group="Market Structure")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TDI CALCULATIONS
+//   RSI(13) → BB(34, 1.6185) → Fast SMA(2) green | Slow SMA(7) red
+// ═══════════════════════════════════════════════════════════════════════════════
+rsi_val  = ta.rsi(close, rsi_period)
+bb_mid   = ta.sma(rsi_val, bb_period)
+bb_std   = ta.stdev(rsi_val, bb_period)
+bb_upper = bb_mid + bb_dev * bb_std
+bb_lower = bb_mid - bb_dev * bb_std
+fast_ma  = ta.sma(rsi_val, fast_period)   // green line
+slow_ma  = ta.sma(rsi_val, slow_period)   // red line
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MARKET STRUCTURE – SWING HIGHS & LOWS (10-bar lookback)
+// ═══════════════════════════════════════════════════════════════════════════════
+ph = ta.pivothigh(high, swing_len, swing_len)
+pl = ta.pivotlow(low,  swing_len, swing_len)
+
+var float last_ph = na
+var float last_pl = na
+
+if not na(ph)
+    last_ph := ph
+if not na(pl)
+    last_pl := pl
+
+// Break of Structure
+bull_bos = not na(last_ph) and close > last_ph and close[1] <= last_ph
+bear_bos = not na(last_pl) and close < last_pl and close[1] >= last_pl
+
+// Trend direction tracking & CHoCH detection
+var int trend_dir = 0   // 1 = bullish  |  -1 = bearish
+
+bull_choch = bull_bos and trend_dir == -1   // first bullish BOS after bearish trend
+bear_choch = bear_bos and trend_dir == 1    // first bearish BOS after bullish trend
+
+if bull_bos
+    trend_dir := 1
+if bear_bos
+    trend_dir := -1
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ENGULFING CANDLE HELPERS (i = bars ago)
+// ═══════════════════════════════════════════════════════════════════════════════
+f_bull_engulf(i) =>
+    close[i] > open[i] and close[i+1] < open[i+1] and
+    close[i] > open[i+1] and open[i] < close[i+1]
+
+f_bear_engulf(i) =>
+    close[i] < open[i] and close[i+1] > open[i+1] and
+    close[i] < open[i+1] and open[i] > close[i+1]
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SUPPLY & DEMAND ZONES (boxes, extended each bar, invalidated on close-through)
+// ═══════════════════════════════════════════════════════════════════════════════
+var float[] dz_hi  = array.new_float()
+var float[] dz_lo  = array.new_float()
+var box[]   dz_box = array.new_box()
+var label[] dz_lbl = array.new_label()
+
+var float[] sz_hi  = array.new_float()
+var float[] sz_lo  = array.new_float()
+var box[]   sz_box = array.new_box()
+var label[] sz_lbl = array.new_label()
+
+// Bullish BOS → look back up to 20 bars for most recent bull engulfing → demand zone
+if bull_bos
+    for j = 1 to 20
+        if f_bull_engulf(j)
+            b = box.new(bar_index - j, high[j], bar_index + 50, low[j],
+                        border_color = color.new(color.green, 70),
+                        bgcolor      = color.new(color.green, 80))
+            lbl = label.new(bar_index - j, high[j], "DEMAND",
+                            style     = label.style_label_down,
+                            color     = color.new(color.green, 50),
+                            textcolor = color.white,
+                            size      = size.small)
+            array.push(dz_box, b)
+            array.push(dz_hi,  high[j])
+            array.push(dz_lo,  low[j])
+            array.push(dz_lbl, lbl)
+            break
+
+// Bearish BOS → look back up to 20 bars for most recent bear engulfing → supply zone
+if bear_bos
+    for j = 1 to 20
+        if f_bear_engulf(j)
+            b = box.new(bar_index - j, high[j], bar_index + 50, low[j],
+                        border_color = color.new(color.red, 70),
+                        bgcolor      = color.new(color.red, 80))
+            lbl = label.new(bar_index - j, high[j], "SUPPLY",
+                            style     = label.style_label_down,
+                            color     = color.new(color.red, 50),
+                            textcolor = color.white,
+                            size      = size.small)
+            array.push(sz_box, b)
+            array.push(sz_hi,  high[j])
+            array.push(sz_lo,  low[j])
+            array.push(sz_lbl, lbl)
+            break
+
+// Process demand zones: extend right edge, check if price is inside, invalidate on close below
+in_dz = false
+dz_i  = 0
+while dz_i < array.size(dz_box)
+    zh = array.get(dz_hi, dz_i)
+    zl = array.get(dz_lo, dz_i)
+    if close < zl
+        box.delete(array.get(dz_box, dz_i))
+        label.delete(array.get(dz_lbl, dz_i))
+        array.remove(dz_box, dz_i)
+        array.remove(dz_hi,  dz_i)
+        array.remove(dz_lo,  dz_i)
+        array.remove(dz_lbl, dz_i)
+    else
+        box.set_right(array.get(dz_box, dz_i), bar_index + 10)
+        if close >= zl and close <= zh
+            in_dz := true
+        dz_i := dz_i + 1
+
+// Process supply zones: extend right edge, check if price is inside, invalidate on close above
+in_sz = false
+sz_i  = 0
+while sz_i < array.size(sz_box)
+    zh = array.get(sz_hi, sz_i)
+    zl = array.get(sz_lo, sz_i)
+    if close > zh
+        box.delete(array.get(sz_box, sz_i))
+        label.delete(array.get(sz_lbl, sz_i))
+        array.remove(sz_box, sz_i)
+        array.remove(sz_hi,  sz_i)
+        array.remove(sz_lo,  sz_i)
+        array.remove(sz_lbl, sz_i)
+    else
+        box.set_right(array.get(sz_box, sz_i), bar_index + 10)
+        if close >= zl and close <= zh
+            in_sz := true
+        sz_i := sz_i + 1
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LIQUIDITY LEVELS
+//   BSL (Buyside)  = swing highs → red dashed line
+//   SSL (Sellside) = swing lows  → green dashed line
+// ═══════════════════════════════════════════════════════════════════════════════
+var float bsl    = na
+var float ssl    = na
+var line  bsl_ln = na
+var line  ssl_ln = na
+
+if not na(ph)
+    bsl := ph
+    line.delete(bsl_ln)
+    bsl_ln := line.new(bar_index - swing_len, ph, bar_index + 30, ph,
+                       color = color.red, style = line.style_dashed, width = 1)
+
+if not na(pl)
+    ssl := pl
+    line.delete(ssl_ln)
+    ssl_ln := line.new(bar_index - swing_len, pl, bar_index + 30, pl,
+                       color = color.green, style = line.style_dashed, width = 1)
+
+// Sweep: wick beyond level then close back inside
+ssl_sweep = not na(ssl) and low  < ssl and close > ssl
+bsl_sweep = not na(bsl) and high > bsl and close < bsl
+
+ssl_recent = ssl_sweep or ssl_sweep[1] or ssl_sweep[2]   // within last 3 candles
+bsl_recent = bsl_sweep or bsl_sweep[1] or bsl_sweep[2]
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TDI BOUNCE CONDITIONS
+//   Bull bounce: fast MA turning up from at/below lower BB
+//   Bear bounce: fast MA turning down from at/above upper BB
+// ═══════════════════════════════════════════════════════════════════════════════
+tdi_bull_bounce = fast_ma > fast_ma[1] and fast_ma[1] <= bb_lower[1]
+tdi_bear_bounce = fast_ma < fast_ma[1] and fast_ma[1] >= bb_upper[1]
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIGNALS
+// ═══════════════════════════════════════════════════════════════════════════════
+buy_sig  = in_dz and ssl_recent and tdi_bull_bounce and (bull_bos or bull_choch)
+sell_sig = in_sz and bsl_recent and tdi_bear_bounce and (bear_bos or bear_choch)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VISUALS – Signal Arrows
+// ═══════════════════════════════════════════════════════════════════════════════
+plotshape(buy_sig,  "BUY Signal",  shape.labelup,   location.belowbar,
+          color.green, text="BUY",  textcolor=color.white, size=size.normal)
+plotshape(sell_sig, "SELL Signal", shape.labeldown, location.abovebar,
+          color.red,   text="SELL", textcolor=color.white, size=size.normal)
+
+// BOS labels
+if bull_bos and not bull_choch
+    label.new(bar_index, low,  "BOS ▲",
+              style     = label.style_label_up,
+              color     = color.new(color.teal, 20),
+              textcolor = color.white,
+              size      = size.tiny)
+if bear_bos and not bear_choch
+    label.new(bar_index, high, "BOS ▼",
+              style     = label.style_label_down,
+              color     = color.new(color.orange, 20),
+              textcolor = color.white,
+              size      = size.tiny)
+
+// CHoCH labels
+if bull_choch
+    label.new(bar_index, low,  "CHoCH ▲",
+              style     = label.style_label_up,
+              color     = color.new(color.purple, 20),
+              textcolor = color.white,
+              size      = size.tiny)
+if bear_choch
+    label.new(bar_index, high, "CHoCH ▼",
+              style     = label.style_label_down,
+              color     = color.new(color.maroon, 20),
+              textcolor = color.white,
+              size      = size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════════════════════
+alertcondition(buy_sig,  "SMC TDI BUY",  "SMC TDI BUY - {{ticker}}")
+alertcondition(sell_sig, "SMC TDI SELL", "SMC TDI SELL - {{ticker}}")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DASHBOARD – top-right corner
+//   Row 0: indicator name | ticker
+//   Row 1: Bias label     | value
+//   Row 2: Signal label   | value
+//   Row 3: TDI RSI label  | value
+// ═══════════════════════════════════════════════════════════════════════════════
+var table dash = table.new(position.top_right, 2, 4,
+                            bgcolor      = color.new(color.black, 70),
+                            border_width = 1,
+                            border_color = color.gray)
+
+if barstate.islast
+    bias_t = trend_dir ==  1 ? "BULLISH" : trend_dir == -1 ? "BEARISH" : "NEUTRAL"
+    bias_c = trend_dir ==  1 ? color.green : trend_dir == -1 ? color.red : color.gray
+    sig_t  = buy_sig  ? "BUY" : sell_sig ? "SELL" : "—"
+    sig_c  = buy_sig  ? color.green : sell_sig ? color.red : color.white
+
+    table.cell(dash, 0, 0, "SMC + TDI Scalper",
+               text_color = color.white,
+               bgcolor    = color.new(color.navy, 20),
+               text_size  = size.small)
+    table.cell(dash, 1, 0, syminfo.ticker,
+               text_color = color.yellow,
+               bgcolor    = color.new(color.navy, 20),
+               text_size  = size.small)
+    table.cell(dash, 0, 1, "Bias",
+               text_color = color.gray,
+               text_size  = size.small)
+    table.cell(dash, 1, 1, bias_t,
+               text_color = bias_c,
+               text_size  = size.small)
+    table.cell(dash, 0, 2, "Signal",
+               text_color = color.gray,
+               text_size  = size.small)
+    table.cell(dash, 1, 2, sig_t,
+               text_color = sig_c,
+               text_size  = size.small)
+    table.cell(dash, 0, 3, "TDI RSI",
+               text_color = color.gray,
+               text_size  = size.small)
+    table.cell(dash, 1, 3, str.tostring(math.round(rsi_val, 2)),
+               text_color = color.yellow,
+               text_size  = size.small)
