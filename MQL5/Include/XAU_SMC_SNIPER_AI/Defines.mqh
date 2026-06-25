@@ -69,6 +69,7 @@ struct FVGZone
    double   mid;
    bool     bullish;
    bool     mitigated;
+   double   filledPct;   // max observed retracement into the gap, 0-100 (v2.0)
   };
 
 //--- supply / demand zone -----------------------------------------------
@@ -80,6 +81,7 @@ struct SDZone
    double      mid;
    ENUM_XSS_ZONE type;
    bool        mitigated;
+   int         touchCount;   // number of distinct retests before mitigation (v2.0)
   };
 
 //--- confluence score breakdown ------------------------------------------
@@ -136,6 +138,93 @@ struct TradeRecord
    double           profit;
    bool             win;
    string           regime;
+   //--- v2.0 additive fields (never read by anything that predates them) ---
+   double           mfe;             // max favorable excursion, in R multiples
+   double           mae;             // max adverse excursion, in R multiples
+   double           slippagePoints;
+   double           latencyMs;
+   string           clusterKey;
+   string           featuresJson;
+  };
+
+//--- market regime classification (v2.0) -----------------------------------
+enum ENUM_XSS_REGIME
+  {
+   REGIME_UNKNOWN = 0,
+   REGIME_STRONG_TREND,
+   REGIME_WEAK_TREND,
+   REGIME_RANGE,
+   REGIME_EXPANSION,
+   REGIME_COMPRESSION,
+   REGIME_HIGH_VOLATILITY,
+   REGIME_LOW_VOLATILITY,
+   REGIME_NEWS_DRIVEN
+  };
+
+//--- engineered feature set persisted alongside every trade/rejection (v2.0) ---
+struct FeatureSnapshot
+  {
+   double   timeSinceLastSweepMin;
+   double   distanceToHtfLiquidity;
+   double   fvgSizeUsd;
+   double   fvgFillPct;
+   int      zoneAgeBars;
+   int      zoneTouchCount;
+   double   bosStrength;
+   double   chochStrength;
+   double   trendSlope;
+   double   bodyWickRatio;
+   double   relativeAtr;
+   double   sessionProgressionPct;
+   double   tickVolume;
+   double   swingDistanceUsd;
+   double   liquidityDensity;
+   double   timeBetweenBosEventsMin;
+  };
+
+//--- adaptive confluence weights - hot-reloadable, AI-tunable, always clamp-enforced (v2.0) ---
+struct AdaptiveWeights
+  {
+   int      version;
+   double   wTrend;
+   double   wSweep;
+   double   wChoch;
+   double   wBos;
+   double   wFvgZone;
+   double   wSession;
+   double   wAtr;
+   double   wSpread;
+
+   double Total() const
+     {
+      return wTrend + wSweep + wChoch + wBos + wFvgZone + wSession + wAtr + wSpread;
+     }
+  };
+
+//--- one execution-quality sample per filled order (v2.0) -------------------
+struct ExecutionQuality
+  {
+   ulong    ticket;
+   datetime orderTime;
+   datetime fillTime;
+   double   requestedPrice;
+   double   filledPrice;
+   double   slippagePoints;
+   double   latencyMs;
+   bool     requoted;
+   bool     missedFill;
+  };
+
+//--- a setup that was scored/considered but NOT traded (v2.0) ---------------
+struct RejectedSetup
+  {
+   datetime         time;
+   ENUM_XSS_BIAS    dir;
+   int              scoreTotal;
+   int              scoreThreshold;
+   string           rejectReason;
+   ENUM_XSS_REGIME  regime;
+   ENUM_XSS_SESSION session;
   };
 
 #endif // __XSS_DEFINES_MQH__

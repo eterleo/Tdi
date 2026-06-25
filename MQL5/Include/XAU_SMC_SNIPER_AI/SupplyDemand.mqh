@@ -24,6 +24,7 @@ private:
    int             m_atrHandle;
 
    SDZone          m_zones[];
+   bool            m_zoneWasInside[];   // previous-bar "price inside zone" state, for touch counting (v2.0)
    int             m_count;
    datetime        m_lastProcessedTime;
 
@@ -32,13 +33,18 @@ private:
       if(m_count < XSS_MAX_SD_ZONES)
         {
          m_zones[m_count] = z;
+         m_zoneWasInside[m_count] = false;
          m_count++;
         }
       else
         {
          for(int i = 1; i < XSS_MAX_SD_ZONES; i++)
+           {
             m_zones[i-1] = m_zones[i];
+            m_zoneWasInside[i-1] = m_zoneWasInside[i];
+           }
          m_zones[XSS_MAX_SD_ZONES-1] = z;
+         m_zoneWasInside[XSS_MAX_SD_ZONES-1] = false;
         }
      }
 
@@ -49,6 +55,7 @@ public:
       m_lastProcessedTime = 0;
       m_atrHandle = INVALID_HANDLE;
       ArrayResize(m_zones, XSS_MAX_SD_ZONES);
+      ArrayResize(m_zoneWasInside, XSS_MAX_SD_ZONES);
      }
 
    void Init(const string symbol, const ENUM_TIMEFRAMES tf, const int scanBars = 60,
@@ -119,6 +126,7 @@ public:
          z.mid       = (baseHigh + baseLow) / 2.0;
          z.type      = bullishImpulse ? ZONE_DEMAND : ZONE_SUPPLY;
          z.mitigated = false;
+         z.touchCount = 0;
 
          if(m_count == 0 || z.time > m_zones[m_count-1].time)
            {
@@ -159,6 +167,13 @@ private:
         {
          if(m_zones[i].mitigated)
             continue;
+
+         //--- touch counting: count a transition from outside -> inside the zone (v2.0) ---
+         bool inside = (lastClose >= m_zones[i].bottom && lastClose <= m_zones[i].top);
+         if(inside && !m_zoneWasInside[i])
+            m_zones[i].touchCount++;
+         m_zoneWasInside[i] = inside;
+
          if(m_zones[i].type == ZONE_DEMAND && lastClose < m_zones[i].bottom)
            {
             m_zones[i].mitigated = true;

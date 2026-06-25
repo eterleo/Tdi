@@ -104,5 +104,23 @@ class Config:
         d.mkdir(parents=True, exist_ok=True)
         return d
 
+    # --- v2.0 market memory additions (CMarketMemory in MarketMemory.mqh) ---
+
+    @property
+    def market_memory_sqlite(self) -> Path:
+        return self.project_dir / "market_memory.sqlite"
+
+    @property
+    def rejected_setups_csv(self) -> Path:
+        return self.project_dir / "rejected_setups.csv"
+
+    @property
+    def feature_snapshots_json(self) -> Path:
+        return self.project_dir / "feature_snapshots.json"
+
+    @property
+    def adaptive_weights_json(self) -> Path:
+        return self.project_dir / "adaptive_weights.json"
+
 
 DEFAULT_CONFIG = Config()

@@ -63,6 +63,27 @@ public:
      {
       return CurrentSession() != SESSION_NONE;
      }
+
+   //--- 0-100, how far through the active session we are; 0 if no session is active (v2.0) ---
+   double SessionProgressionPct() const
+     {
+      datetime qt = BrokerTimeToQatarTime(TimeCurrent());
+      MqlDateTime dt;
+      TimeToStruct(qt, dt);
+      double minuteOfDay = dt.hour * 60.0 + dt.min;
+
+      ENUM_XSS_SESSION sess = CurrentSession();
+      double startH, endH;
+      if(sess == SESSION_LONDON)      { startH = m_londonStartHour; endH = m_londonEndHour; }
+      else if(sess == SESSION_NEWYORK) { startH = m_nyStartHour;     endH = m_nyEndHour;     }
+      else                             return 0.0;
+
+      double span = (endH - startH) * 60.0;
+      if(span <= 0)
+         return 0.0;
+      double elapsed = minuteOfDay - startH * 60.0;
+      return MathMax(0.0, MathMin(100.0, 100.0 * elapsed / span));
+     }
   };
 
 #endif // __XSS_SESSIONFILTER_MQH__

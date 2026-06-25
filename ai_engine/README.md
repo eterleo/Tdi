@@ -48,7 +48,12 @@ Each poll: if the EA has written `evolution_trigger.json` (every
 runs one full cycle:
 
 1. `data_loader.load_all` + `pattern_discovery.discover` - bucket recent
-   trades by session / regime / sweep / zone / score.
+   trades by session / regime / sweep / zone / score. `load_all` also reads
+   the SQLite mirror (`market_memory.sqlite`'s `trades`, `rejected_setups`,
+   `feature_snapshots` tables), and `pattern_clustering.discover` groups
+   those SQLite trades by `cluster_key` (regime+session+sweep+zone-type),
+   ranking each cluster by win rate, profit factor, expectancy, drawdown,
+   and average RR.
 2. `param_evolution.propose_next_version` - ask the local AI for numeric
    tweaks (or fall back to a deterministic heuristic), then hard-clamp
    every value to `BOUNDS` and a max 20%-per-cycle step regardless of what
@@ -68,7 +73,14 @@ runs one full cycle:
    `AIGateway`, no restart) and promote the candidate module into the live
    `MQL5/Include/XAU_SMC_SNIPER_AI/` tree, recording `structural_change` in
    `version_status.json` so the EA knows whether a restart-and-swap is
-   needed.
+   needed. Notes are enriched via `version_manager.build_notes` with the
+   parameter diff and any changed module, without altering the file's
+   schema (searchable afterwards via `version_manager.search_history`).
+7. Only on that same approval, `adaptive_weight_evolution.propose_next_version`
+   measures each confluence factor's win-rate lift from the SQLite trades
+   and writes `adaptive_weights.json` (clamped to `[0, 60]` per weight, max
+   15%-per-cycle step) - picked up live by `AdaptiveConfluence` on its next
+   timer tick, the same hot-reload pattern as `strategy_params.json`.
 
 `deploy_watchdog.check_and_deploy` runs alongside: when
 `evolution_state.json` has `pending_restart: true`, it waits until this

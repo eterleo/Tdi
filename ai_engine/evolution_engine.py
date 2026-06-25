@@ -14,9 +14,10 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import asdict
 from typing import Optional
 
-from . import compiler, module_evolution, version_manager
+from . import adaptive_weight_evolution, compiler, module_evolution, pattern_clustering, version_manager
 from .ai_client import LocalAIClient
 from .backtest_validator import run_backtest
 from .config import Config
@@ -82,6 +83,7 @@ def run_cycle(cfg: Config) -> bool:
         return False
 
     discovery = discover(data)
+    cluster_report = pattern_clustering.discover(data.sqlite_trades)
     current_params = _current_params(cfg, current_version)
     ai = LocalAIClient(cfg)
 
@@ -100,6 +102,8 @@ def run_cycle(cfg: Config) -> bool:
             module_file = None
 
     notes_prefix = f"target_module={module_key}; " if do_structural else ""
+    changed_modules = [module_key] if (do_structural and module_key) else []
+    param_diff = version_manager.diff_params(asdict(current_params), asdict(next_params))
 
     compile_result = compiler.compile_version(cfg, next_version)
     if compile_result.skipped:
@@ -128,9 +132,20 @@ def run_cycle(cfg: Config) -> bool:
         _consume_trigger(cfg)
         return True
 
+    cluster_note = f"; best_cluster={cluster_report.best_cluster}" if cluster_report.best_cluster else ""
     notes = (f"{notes_prefix}{discovery.overall_win_rate_pct:.1f}% WR over {discovery.total_trades} trades; "
-            f"backtest PF={bt_result.report.profit_factor:.2f} DD={bt_result.report.max_drawdown_pct:.1f}%")
+            f"backtest PF={bt_result.report.profit_factor:.2f} DD={bt_result.report.max_drawdown_pct:.1f}%"
+            f"{cluster_note}")
+    notes = version_manager.build_notes(notes, changed_modules=changed_modules, param_diff=param_diff)
     version_manager.approve_candidate(cfg, next_version, notes=notes, structural_change=do_structural,
                                       params=next_params, module_file=module_file)
+
+    # adaptive confluence weights: hot-reloaded data, no compile/backtest of
+    # their own - gated behind the same approval as strategy_params.json so
+    # both live-reloaded files only ever move together on a validated cycle
+    current_weights = adaptive_weight_evolution.current_weights(cfg)
+    next_weights = adaptive_weight_evolution.propose_next_version(data.sqlite_trades, current_weights, ai)
+    adaptive_weight_evolution.write_adaptive_weights(cfg, next_weights)
+
     _consume_trigger(cfg)
     return True

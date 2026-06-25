@@ -13,9 +13,9 @@
 //|  its (honest) constraints around live code hot-swap.              |
 //+------------------------------------------------------------------+
 #property copyright "XAU_SMC_SNIPER_AI"
-#property version   "1.00"
+#property version   "2.00"
 #property strict
-#property description "Self-evolving XAUUSD SMC sniper EA (M1/M5) with local-AI driven parameter & module evolution."
+#property description "Self-evolving XAUUSD SMC sniper EA (M1/M5) with local-AI driven parameter & module evolution. v2.0: market memory, regime classification, adaptive confluence, execution optimizer, analytics dashboard."
 
 #include <XAU_SMC_SNIPER_AI/Defines.mqh>
 #include <XAU_SMC_SNIPER_AI/MarketStructure.mqh>
@@ -32,6 +32,11 @@
 #include <XAU_SMC_SNIPER_AI/MarketMemory.mqh>
 #include <XAU_SMC_SNIPER_AI/AIGateway.mqh>
 #include <XAU_SMC_SNIPER_AI/CodeEvolutionEngine.mqh>
+#include <XAU_SMC_SNIPER_AI/FeatureEngine.mqh>
+#include <XAU_SMC_SNIPER_AI/MarketRegime.mqh>
+#include <XAU_SMC_SNIPER_AI/AdaptiveConfluence.mqh>
+#include <XAU_SMC_SNIPER_AI/ExecutionOptimizer.mqh>
+#include <XAU_SMC_SNIPER_AI/Dashboard.mqh>
 
 //================================== INPUTS ==========================================
 input group "=== Risk Management ==="
@@ -93,6 +98,12 @@ input string InpAiEndpointUrl         = "http://127.0.0.1:11434/api/generate"; /
 input string InpAiModel               = "qwen2.5-coder";
 input int    InpEvolutionTradesPerCycle = 50;
 
+input group "=== v2.0 Adaptive / Dashboard ==="
+input bool InpUseAdaptiveConfluence = true;  // also require the adaptive-weighted score to clear the threshold
+input bool InpShowDashboard         = true;
+input int  InpDashboardX            = 12;
+input int  InpDashboardY            = 20;
+
 input group "=== General ==="
 input ulong  InpMagicNumber = XSS_MAGIC_NUMBER;
 
@@ -112,6 +123,14 @@ CStatistics           g_stats;
 CMarketMemory         g_memory;
 CAIGateway            g_ai;
 CCodeEvolutionEngine  g_evolution;
+
+//--- v2.0 additions ---
+CFeatureEngine        g_features;
+CMarketRegime         g_regime;
+CAdaptiveConfluence   g_adaptive;
+CExecutionOptimizer   g_execOpt;
+CDashboard            g_dashboard;
+double                g_lastAdaptiveScore = 0.0;
 
 int      g_atrM5Handle = INVALID_HANDLE;
 datetime g_lastM1BarTime = 0;
@@ -136,6 +155,9 @@ struct PendingCtx
    double           spread;
    double           riskDistance;
    ENUM_XSS_SESSION session;
+   //--- v2.0 additive fields ---
+   ENUM_XSS_REGIME  regime;
+   string           featuresJson;
   };
 PendingCtx g_pending[];
 
@@ -154,6 +176,9 @@ struct PositionCtx
    double           atr;
    double           spread;
    ENUM_XSS_SESSION session;
+   //--- v2.0 additive fields ---
+   ENUM_XSS_REGIME  regime;
+   string           featuresJson;
   };
 PositionCtx g_positions[];
 
@@ -214,10 +239,17 @@ int OnInit()
                InpDailyDrawdownLimitPct, InpWeeklyDrawdownLimitPct);
 
    g_telegram.Init(InpTelegramBotToken, InpTelegramChatId, InpTelegramEnabled);
-   g_tradeMgr.Init(_Symbol, InpMagicNumber, GetPointer(g_telegram), 30);
+   g_execOpt.Init();
+   g_tradeMgr.Init(_Symbol, InpMagicNumber, GetPointer(g_telegram), 30, GetPointer(g_execOpt));
    g_memory.Init();
    g_ai.Init(InpAiEndpointUrl, InpAiModel);
    g_evolution.Init(GetPointer(g_memory), GetPointer(g_telegram), InpEvolutionTradesPerCycle);
+
+   g_features.Init(_Symbol, PERIOD_M5, InpAtrPeriod);
+   g_regime.Init(_Symbol, PERIOD_M5, InpAtrPeriod);
+   g_adaptive.Init();
+   if(InpShowDashboard)
+      g_dashboard.Init(InpDashboardX, InpDashboardY);
 
    g_atrM5Handle = iATR(_Symbol, PERIOD_M5, InpAtrPeriod);
    if(g_atrM5Handle == INVALID_HANDLE)
@@ -237,6 +269,7 @@ void OnDeinit(const int reason)
    EventKillTimer();
    if(g_atrM5Handle != INVALID_HANDLE)
       IndicatorRelease(g_atrM5Handle);
+   g_dashboard.Remove();
   }
 
 //+------------------------------------------------------------------+
@@ -337,18 +370,61 @@ void TryEnter(const ENUM_XSS_BIAS dir)
    snap.score          = score;
    g_memory.LogMarketState(snap);
 
+   //--- v2.0: adaptive-weighted score + engineered features, computed alongside the legacy path ---
+   double adaptiveScore = g_adaptive.Score(score.h1Bias > 0, score.liquiditySweep > 0, score.choch > 0, score.bos > 0,
+                                            score.fvgZone > 0, score.session > 0, score.atr > 0,
+                                            snap.spreadPoints, (double)InpMaxSpreadPoints);
+   g_lastAdaptiveScore = adaptiveScore;
+
+   FeatureSnapshot feats = g_features.Compute(dir, g_liquidity, g_m1Structure, g_m15Structure, g_trend, g_session,
+                                               fvgZone, haveFvg, sdZone, haveSd);
+   string featuresJson = CFeatureEngine::ToJson(feats);
+   g_memory.LogFeatureSnapshot(TimeCurrent(), "scan", featuresJson);
+
    if(total < g_liveScoreThreshold)
+     {
+      RejectedSetup rs;
+      rs.time = TimeCurrent(); rs.dir = dir; rs.scoreTotal = total; rs.scoreThreshold = g_liveScoreThreshold;
+      rs.rejectReason = "score_below_threshold"; rs.regime = g_regime.Current(); rs.session = session;
+      g_memory.LogRejectedSetup(rs, featuresJson);
       return;
+     }
+
+   //--- additional adaptive confirmation gate - only ever makes entry MORE conservative, never less ---
+   if(InpUseAdaptiveConfluence && g_adaptive.NormalizedPct(adaptiveScore) < (double)g_liveScoreThreshold)
+     {
+      RejectedSetup rs;
+      rs.time = TimeCurrent(); rs.dir = dir; rs.scoreTotal = total; rs.scoreThreshold = g_liveScoreThreshold;
+      rs.rejectReason = "adaptive_score_below_threshold"; rs.regime = g_regime.Current(); rs.session = session;
+      g_memory.LogRejectedSetup(rs, featuresJson);
+      return;
+     }
 
    //--- hard gates not part of the 0-100 score ---
    if(snap.spreadPoints > InpMaxSpreadPoints)
+     {
+      RejectedSetup rs;
+      rs.time = TimeCurrent(); rs.dir = dir; rs.scoreTotal = total; rs.scoreThreshold = g_liveScoreThreshold;
+      rs.rejectReason = "spread_too_wide"; rs.regime = g_regime.Current(); rs.session = session;
+      g_memory.LogRejectedSetup(rs, featuresJson);
       return;
+     }
    if(g_news.IsBlackout(TimeCurrent()))
+     {
+      RejectedSetup rs;
+      rs.time = TimeCurrent(); rs.dir = dir; rs.scoreTotal = total; rs.scoreThreshold = g_liveScoreThreshold;
+      rs.rejectReason = "news_blackout"; rs.regime = g_regime.Current(); rs.session = session;
+      g_memory.LogRejectedSetup(rs, featuresJson);
       return;
+     }
 
    string reason;
    if(!g_risk.CanTrade(reason))
      {
+      RejectedSetup rs;
+      rs.time = TimeCurrent(); rs.dir = dir; rs.scoreTotal = total; rs.scoreThreshold = g_liveScoreThreshold;
+      rs.rejectReason = "risk_locked: " + reason; rs.regime = g_regime.Current(); rs.session = session;
+      g_memory.LogRejectedSetup(rs, featuresJson);
       Print("[XAU_SMC_SNIPER_AI] Trading halted: ", reason);
       return;
      }
@@ -387,6 +463,8 @@ void TryEnter(const ENUM_XSS_BIAS dir)
    ctx.spread       = snap.spreadPoints;
    ctx.riskDistance = riskDistance;
    ctx.session      = session;
+   ctx.regime       = g_regime.Current();
+   ctx.featuresJson = featuresJson;
    int n = ArraySize(g_pending);
    ArrayResize(g_pending, n + 1);
    g_pending[n] = ctx;
@@ -410,6 +488,9 @@ void OnTick()
    g_liquidity.Update();
    g_fvg.Update();
    g_supplyDemand.Update();
+
+   //--- v2.0: regime classification runs every bar, independent of whether a trade is attempted ---
+   g_regime.Classify(g_trend.Slope(), SymbolInfoDouble(_Symbol, SYMBOL_POINT), g_m1Structure, g_news, TimeCurrent());
 
    ENUM_XSS_BIAS bias = g_trend.Bias();
    if(bias == BIAS_NONE)
@@ -436,6 +517,32 @@ void ApplyAiParamUpdate()
    PrintFormat("[XAU_SMC_SNIPER_AI] Applied AI parameter update v%d: atrThreshold=%.2f scoreThreshold=%d riskPct=%.2f maxBarsChochBos=%d",
                p.version, g_liveAtrThreshold, g_liveScoreThreshold, g_liveRiskPercent, g_liveMaxBarsChochBos);
    g_telegram.SendEvolutionNotice(StringFormat("Live parameters updated to v%d.", p.version));
+  }
+
+//--- v2.0: hot-reload of adaptive confluence weights, mirrors ApplyAiParamUpdate's version-gated pattern ---
+void ApplyAdaptiveWeightUpdate()
+  {
+   AdaptiveWeights w;
+   if(!g_adaptive.FetchWeightUpdate(w))
+      return;
+
+   PrintFormat("[XAU_SMC_SNIPER_AI] Applied adaptive confluence weights v%d", w.version);
+   g_telegram.SendEvolutionNotice(StringFormat("Adaptive confluence weights updated to v%d.", w.version));
+  }
+
+void RenderDashboard()
+  {
+   if(!InpShowDashboard)
+      return;
+
+   int strategyVersion = g_evolution.CurrentVersion();
+   double aiConfidencePct = g_adaptive.NormalizedPct(g_lastAdaptiveScore);
+   double spreadPoints = (double)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+
+   g_dashboard.Render(_Symbol, InpMagicNumber, strategyVersion, aiConfidencePct,
+                       g_lastAdaptiveScore, g_adaptive.MaxPossibleScore(),
+                       spreadPoints, GetAtrM5(),
+                       g_regime, g_adaptive, g_execOpt, g_stats, g_risk);
   }
 
 void SendScheduledReports()
@@ -469,8 +576,10 @@ void SendScheduledReports()
 void OnTimer()
   {
    ApplyAiParamUpdate();
+   ApplyAdaptiveWeightUpdate();
    g_evolution.PollVersionStatus();
    SendScheduledReports();
+   RenderDashboard();
   }
 
 //+------------------------------------------------------------------+
@@ -520,12 +629,14 @@ void HandlePositionOpened(const ulong dealTicket)
    pc.atr          = g_pending[pendingIdx].atr;
    pc.spread       = g_pending[pendingIdx].spread;
    pc.session      = g_pending[pendingIdx].session;
+   pc.regime       = g_pending[pendingIdx].regime;
+   pc.featuresJson = g_pending[pendingIdx].featuresJson;
 
    int n = ArraySize(g_positions);
    ArrayResize(g_positions, n + 1);
    g_positions[n] = pc;
 
-   g_tradeMgr.RegisterFilledPosition(positionTicket, entryPrice, sl, pc.dir, lots);
+   g_tradeMgr.RegisterFilledPosition(positionTicket, entryPrice, sl, pc.dir, lots, orderTicket);
    RemovePending(pendingIdx);
   }
 
@@ -545,6 +656,24 @@ void HandlePositionClosed(const ulong positionTicket)
    double rr = (riskMoney > 0) ? (totalProfit / riskMoney) : 0.0;
    bool win = totalProfit > 0;
 
+   //--- v2.0: MFE/MAE must be read BEFORE Untrack() removes the tracked position ---
+   double mfeR = 0.0, maeR = 0.0;
+   g_tradeMgr.GetMfeMae(positionTicket, mfeR, maeR);
+
+   double slippagePoints = 0.0, latencyMs = 0.0;
+   for(int i = g_tradeMgr.ExecutionQualityCount() - 1; i >= 0; i--)
+     {
+      ExecutionQuality eq;
+      if(!g_tradeMgr.GetExecutionQuality(i, eq))
+         continue;
+      if(eq.ticket == positionTicket)
+        {
+         slippagePoints = eq.slippagePoints;
+         latencyMs      = eq.latencyMs;
+         break;
+        }
+     }
+
    TradeRecord tr;
    tr.ticket      = positionTicket;
    tr.openTime    = g_positions[idx].openTime;
@@ -563,9 +692,18 @@ void HandlePositionClosed(const ulong positionTicket)
    tr.profit      = totalProfit;
    tr.win         = win;
    tr.regime      = CStatistics::ClassifyRegime(tr.atr, g_liveAtrThreshold, tr.session);
+   //--- v2.0 additive fields ---
+   tr.mfe            = mfeR;
+   tr.mae            = maeR;
+   tr.slippagePoints = slippagePoints;
+   tr.latencyMs       = latencyMs;
+   tr.clusterKey      = StringFormat("%s_%s_%s_%s", CMarketRegime::ToString(g_positions[idx].regime),
+                                      XSS_SessionToStr(tr.session), XSS_SweepToStr(tr.sweep), XSS_ZoneToStr(tr.zoneType));
+   tr.featuresJson    = g_positions[idx].featuresJson;
 
    g_memory.LogTrade(tr);
-   g_stats.RegisterTrade(totalProfit, rr, win);
+   //--- regime-segmented stats use the v2.0 market-regime classification, not the legacy vol/session tag ---
+   g_stats.RegisterTrade(totalProfit, rr, win, CMarketRegime::ToString(g_positions[idx].regime));
    g_risk.RegisterTradeResult(win);
    g_evolution.OnTradeClosed();
    g_telegram.SendTradeClosed(positionTicket, totalProfit, rr, win);

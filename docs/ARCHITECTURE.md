@@ -98,15 +98,83 @@ git operation, always reversible at runtime.
 | `trades.csv` | EA (`MarketMemory`) | `ai_engine.data_loader` | one row per closed trade |
 | `market_states.json` (JSONL) | EA | `ai_engine.data_loader` | per-bar snapshot log |
 | `performance.csv` | EA | `ai_engine.data_loader` | rolling day/week stats |
-| `strategy_history.json` (JSONL) | EA | — | append-only version-transition log |
+| `strategy_history.json` (JSONL) | EA | `ai_engine.version_manager.search_history` | append-only, searchable version-transition log |
 | `evolution_trigger.json` | EA | `ai_engine.evolution_engine` | "run a cycle now" signal, every N closed trades |
 | `strategy_params.json` | `ai_engine.version_manager` | EA (`AIGateway`) | live numeric params, version-gated |
 | `version_status.json` | `ai_engine.version_manager` | EA (`CodeEvolutionEngine`) | approve/reject verdict for one version |
 | `evolution_state.json` | EA | `ai_engine.deploy_watchdog` | current version + `pending_restart` flag |
 | `module_flags.json` | `ai_engine` (future) | EA (`CodeEvolutionEngine`) | module on/off toggles |
+| `market_memory.sqlite` | EA (`MarketMemory`) | `ai_engine.data_loader` / `pattern_clustering` | structured mirror of `trades`, `rejected_setups`, `feature_snapshots` tables |
+| `rejected_setups.csv` + table | EA (`MarketMemory`) | `ai_engine.data_loader` | setups that scored/were considered but not traded — learning from near-misses |
+| `feature_snapshots.json` (JSONL) + table | EA (`FeatureEngine` via `MarketMemory`) | `ai_engine.data_loader` | engineered-feature vector per scan (`FeatureSnapshot`) |
+| `adaptive_weights.json` | `ai_engine.adaptive_weight_evolution` | EA (`AdaptiveConfluence`) | live, version-gated weights for the adaptive confluence score |
 
 No file in this directory is ever read by more than one side without going
 through this table — the contract is the entire integration surface.
+
+## v2.0 additions
+
+Everything below is **additive**: every v1.0 struct, method signature, and
+file is unchanged, and the legacy static `ConfluenceScore`/`BuildScore` gate
+still runs exactly as before. v2.0 adds a parallel market-memory, analytics,
+and adaptive-scoring layer on top.
+
+- **`MarketRegime.mqh`** — classifies every bar into one of
+  `ENUM_XSS_REGIME` (Strong/Weak Trend, Range, Expansion, Compression,
+  High/Low Volatility, News Driven), independent of the legacy
+  `CStatistics::ClassifyRegime` vol+session string still stored in
+  `TradeRecord.regime` for backward compatibility. The new classification
+  feeds `CStatistics::RegisterTrade`'s optional `regime` parameter for
+  regime-segmented stats, and `TradeRecord.clusterKey`.
+- **`FeatureEngine.mqh`** — computes a `FeatureSnapshot` (time since last
+  sweep, distance to HTF liquidity, FVG size/fill %, zone age/touch count,
+  BOS/CHOCH strength, trend slope, body/wick ratio, relative ATR, session
+  progression, tick volume, swing distance, liquidity density, time between
+  BOS events) on every scan — logged via `MarketMemory.LogFeatureSnapshot`
+  for trades, rejections, and plain scans alike.
+- **`AdaptiveConfluence.mqh`** — a second, weighted confluence score computed
+  *alongside* the legacy score, with weights hot-reloaded from
+  `adaptive_weights.json` the same version-gated way `AIGateway` reloads
+  `strategy_params.json`. When `InpUseAdaptiveConfluence` is enabled it adds
+  an extra `NormalizedPct(score) >= threshold` requirement on top of — never
+  instead of — the legacy gate, so it can only make entries more
+  conservative.
+- **`ExecutionOptimizer.mqh`** — aggregates the slippage/latency/requote/
+  missed-fill samples `TradeManager.mqh` already pushes to it (a "push"
+  pattern via an optional `CExecutionOptimizer*` pointer) into avg/rate
+  metrics for the dashboard. `TradeManager.mqh` also tracks per-position
+  max favorable/adverse excursion (MFE/MAE) in R-multiples.
+- **`Dashboard.mqh`** — a read-only on-chart panel (`OBJ_LABEL` /
+  `OBJ_RECTANGLE_LABEL`, redrawn on the existing timer, not every tick)
+  showing regime, strategy version, AI confidence, confluence score, risk,
+  daily/weekly/all-time performance, best/worst regime by win rate, and
+  execution quality. It owns no trading state and never influences entries.
+- **`MarketMemory.mqh`** — gained a SQLite mirror (`market_memory.sqlite`)
+  of the CSV/JSON logs (native MT5 `Database*` API), plus
+  `rejected_setups.csv`/table (every setup that scored or was considered but
+  not traded, with its reject reason) and `feature_snapshots.json`/table —
+  so the AI can learn from near-misses, not just executed trades.
+- **`CStatistics`** — gained Expectancy, Profit Factor, Avg Win/Loss,
+  Recovery Factor, Sharpe/Sortino/Calmar ratios, and per-regime win-rate
+  buckets (`RegisterTrade`'s new optional `regime` parameter), all backward
+  compatible with the original `WinRatePct`/`AvgRR`/daily/weekly accessors.
+- **`ai_engine/pattern_clustering.py`** — the Pattern Discovery Engine:
+  groups closed trades by `TradeRecord.clusterKey` (regime+session+sweep+
+  zone-type) and ranks clusters by win rate, profit factor, expectancy,
+  drawdown, and average RR — a finer-grained complement to
+  `pattern_discovery.py`'s single-dimension buckets.
+- **`ai_engine/adaptive_weight_evolution.py`** — measures each confluence
+  factor's win-rate lift (presence vs. absence in closed trades, reading
+  `trades`/`features_json` from the SQLite mirror) and proposes new
+  `AdaptiveWeights`, clamped to `[0, 60]` per weight with a max 15%-per-cycle
+  step — mirroring `param_evolution.py`'s clamp discipline. Weights are only
+  written on the same validated (compile+backtest-passing) cycle that writes
+  `strategy_params.json`, so both live-reloaded files move together.
+- **`ai_engine/version_manager.py`** — gained `diff_params` (field-level
+  before/after diff), `build_notes` (appends modules-changed + param-diff
+  to a version's notes without changing the `version_status.json` /
+  `strategy_history.json` schema the EA reads), and `search_history`
+  (filter the append-only history log by version/status/notes substring).
 
 ## What the AI never does
 

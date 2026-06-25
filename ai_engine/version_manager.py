@@ -17,14 +17,64 @@ import logging
 import shutil
 from dataclasses import asdict
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from .config import Config
+from .data_loader import load_all
 from .param_evolution import StrategyParams
 
 log = logging.getLogger(__name__)
 
 LIVE_INCLUDE_DIR = Path(__file__).resolve().parent.parent / "MQL5" / "Include" / "XAU_SMC_SNIPER_AI"
+
+
+def diff_params(old: Optional[Dict[str, Any]], new: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Field-level diff between two parameter/weight dicts of the same shape -
+    used to make each version's notes self-explanatory about exactly what
+    changed, without altering the version_status.json / strategy_history.json
+    schema the EA itself reads (both still just see a free-text notes field)."""
+    if not old:
+        return {k: {"old": None, "new": v} for k, v in new.items()}
+    diff: Dict[str, Dict[str, Any]] = {}
+    for key, new_val in new.items():
+        old_val = old.get(key)
+        if old_val != new_val:
+            diff[key] = {"old": old_val, "new": new_val}
+    return diff
+
+
+def build_notes(base_notes: str, changed_modules: Optional[List[str]] = None,
+                param_diff: Optional[Dict[str, Dict[str, Any]]] = None) -> str:
+    """Appends a compact, machine-parseable suffix to base_notes describing
+    which modules changed and which parameters moved - additive only, since
+    notes was always a free-text field on both the live status file and the
+    append-only history log."""
+    suffix_parts = []
+    if changed_modules:
+        suffix_parts.append(f"modules={changed_modules}")
+    if param_diff:
+        suffix_parts.append(f"diff={json.dumps(param_diff, sort_keys=True)}")
+    if not suffix_parts:
+        return base_notes
+    return f"{base_notes} | " + " | ".join(suffix_parts)
+
+
+def search_history(cfg: Config, *, version: Optional[int] = None, status: Optional[str] = None,
+                   contains: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Searches the append-only strategy_history.json log (every version ever
+    proposed, approved or rejected) by version number, status, and/or a
+    case-insensitive substring of notes - the "searchable history" the v2.0
+    multi-version management spec calls for."""
+    history = load_all(cfg).strategy_history
+    results = history
+    if version is not None:
+        results = [h for h in results if h.get("version") == version]
+    if status is not None:
+        results = [h for h in results if h.get("status") == status]
+    if contains is not None:
+        needle = contains.lower()
+        results = [h for h in results if needle in (h.get("notes") or "").lower()]
+    return results
 
 
 def write_strategy_params(cfg: Config, params: StrategyParams) -> None:

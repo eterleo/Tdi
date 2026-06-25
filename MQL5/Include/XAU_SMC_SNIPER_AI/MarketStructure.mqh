@@ -27,17 +27,19 @@ private:
 
    ENUM_XSS_STRUCT_EVENT m_eventLog[];
    datetime              m_eventTimeLog[];
+   double                 m_eventStrengthLog[];  // |breaking close - broken swing level|, in price units (v2.0)
    int                    m_eventCount;
 
    ENUM_XSS_BIAS     m_trend;          // internal structural trend
    datetime          m_lastProcessedBarTime;
 
-   void PushEvent(const ENUM_XSS_STRUCT_EVENT ev, const datetime t)
+   void PushEvent(const ENUM_XSS_STRUCT_EVENT ev, const datetime t, const double strength = 0.0)
      {
       if(m_eventCount < XSS_MAX_EVENT_LOG)
         {
          m_eventLog[m_eventCount] = ev;
          m_eventTimeLog[m_eventCount] = t;
+         m_eventStrengthLog[m_eventCount] = strength;
          m_eventCount++;
         }
       else
@@ -46,9 +48,11 @@ private:
            {
             m_eventLog[i-1] = m_eventLog[i];
             m_eventTimeLog[i-1] = m_eventTimeLog[i];
+            m_eventStrengthLog[i-1] = m_eventStrengthLog[i];
            }
          m_eventLog[XSS_MAX_EVENT_LOG-1] = ev;
          m_eventTimeLog[XSS_MAX_EVENT_LOG-1] = t;
+         m_eventStrengthLog[XSS_MAX_EVENT_LOG-1] = strength;
         }
      }
 
@@ -94,6 +98,7 @@ public:
       ArrayResize(m_swingLows,  XSS_MAX_SWING_LOG);
       ArrayResize(m_eventLog,     XSS_MAX_EVENT_LOG);
       ArrayResize(m_eventTimeLog, XSS_MAX_EVENT_LOG);
+      ArrayResize(m_eventStrengthLog, XSS_MAX_EVENT_LOG);
      }
 
    void Init(const string symbol, const ENUM_TIMEFRAMES tf, const int leftBars = 2,
@@ -182,19 +187,58 @@ public:
       if(m_swingHighCount > 0 && lastClose > m_swingHighs[m_swingHighCount-1].price)
         {
          ENUM_XSS_STRUCT_EVENT ev = (m_trend == BIAS_BEARISH || m_trend == BIAS_NONE) ? STRUCT_CHOCH_BULL : STRUCT_BOS_BULL;
-         PushEvent(ev, lastTime);
+         PushEvent(ev, lastTime, MathAbs(lastClose - m_swingHighs[m_swingHighCount-1].price));
          m_trend = BIAS_BULLISH;
          newEvent = true;
         }
       else if(m_swingLowCount > 0 && lastClose < m_swingLows[m_swingLowCount-1].price)
         {
          ENUM_XSS_STRUCT_EVENT ev = (m_trend == BIAS_BULLISH || m_trend == BIAS_NONE) ? STRUCT_CHOCH_BEAR : STRUCT_BOS_BEAR;
-         PushEvent(ev, lastTime);
+         PushEvent(ev, lastTime, MathAbs(lastClose - m_swingLows[m_swingLowCount-1].price));
          m_trend = BIAS_BEARISH;
          newEvent = true;
         }
 
       return newEvent;
+     }
+
+   //--- |breaking close - broken swing level| of the most recent BOS/CHOCH, in price units (v2.0) ---
+   double LastEventStrength() const
+     {
+      if(m_eventCount == 0)
+         return 0.0;
+      return m_eventStrengthLog[m_eventCount-1];
+     }
+
+   //--- timestamps of the two most recent BOS events (either direction), for "time between BOS" (v2.0) ---
+   bool LastTwoBosEvents(datetime &recent, datetime &prior) const
+     {
+      int found = 0;
+      recent = 0; prior = 0;
+      for(int i = m_eventCount - 1; i >= 0 && found < 2; i--)
+        {
+         if(m_eventLog[i] == STRUCT_BOS_BULL || m_eventLog[i] == STRUCT_BOS_BEAR)
+           {
+            if(found == 0) recent = m_eventTimeLog[i];
+            else            prior  = m_eventTimeLog[i];
+            found++;
+           }
+        }
+      return found >= 2;
+     }
+
+   //--- count of confirmed swing points (highs+lows) within the last N bars - a liquidity-density proxy (v2.0) ---
+   int CountSwingsWithinBars(const int bars) const
+     {
+      datetime cutoff = TimeCurrent() - (datetime)((long)bars * PeriodSeconds(m_tf));
+      int count = 0;
+      for(int i = 0; i < m_swingHighCount; i++)
+         if(m_swingHighs[i].time >= cutoff)
+            count++;
+      for(int i = 0; i < m_swingLowCount; i++)
+         if(m_swingLows[i].time >= cutoff)
+            count++;
+      return count;
      }
 
    ENUM_XSS_STRUCT_EVENT LastEventOfTypes(const ENUM_XSS_STRUCT_EVENT typeA, const ENUM_XSS_STRUCT_EVENT typeB) const

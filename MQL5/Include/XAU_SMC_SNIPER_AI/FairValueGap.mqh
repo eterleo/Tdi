@@ -79,6 +79,7 @@ public:
                z.mid       = (z.top + z.bottom) / 2.0;
                z.bullish   = true;
                z.mitigated = false;
+               z.filledPct = 0.0;
                if(m_count == 0 || z.time > m_zones[m_count-1].time)
                   PushZone(z);
                foundNew = true;
@@ -93,6 +94,7 @@ public:
                z.mid       = (z.top + z.bottom) / 2.0;
                z.bullish   = false;
                z.mitigated = false;
+               z.filledPct = 0.0;
                if(m_count == 0 || z.time > m_zones[m_count-1].time)
                   PushZone(z);
                foundNew = true;
@@ -100,12 +102,23 @@ public:
            }
         }
 
-      //--- mitigation pass: a zone is fully mitigated once price closes through it ---
+      //--- mitigation pass: a zone is fully mitigated once price closes through it.
+      //--- also tracks the deepest retracement into each still-open zone (v2.0). ---
       double lastClose = rates[1].close;
       for(int i = 0; i < m_count; i++)
         {
          if(m_zones[i].mitigated)
             continue;
+
+         double height = m_zones[i].top - m_zones[i].bottom;
+         if(height > 0)
+           {
+            double penetration = m_zones[i].bullish ? (m_zones[i].top - lastClose) : (lastClose - m_zones[i].bottom);
+            double pct = MathMax(0.0, MathMin(100.0, 100.0 * penetration / height));
+            if(pct > m_zones[i].filledPct)
+               m_zones[i].filledPct = pct;
+           }
+
          if(m_zones[i].bullish && lastClose < m_zones[i].bottom)
             m_zones[i].mitigated = true;
          else if(!m_zones[i].bullish && lastClose > m_zones[i].top)

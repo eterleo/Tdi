@@ -70,6 +70,16 @@ public:
 
    ENUM_XSS_BIAS Bias() const { return m_bias; }
    CMarketStructure *Structure() { return GetPointer(m_structure); }
+
+   //--- fast-EMA slope over the last N closed bars, in price units per bar (v2.0) ---
+   double Slope(const int bars = 5) const
+     {
+      double buf[];
+      ArraySetAsSeries(buf, true);
+      if(CopyBuffer(m_emaFastHandle, 0, 1, bars + 1, buf) < bars + 1)
+         return 0.0;
+      return (buf[0] - buf[bars]) / bars;
+     }
   };
 
 #endif // __XSS_TRENDENGINE_MQH__
