@@ -1,0 +1,5 @@
+requests>=2.31
+
+# optional: only needed for deploy_watchdog.py's live "are we flat" check,
+# and only available on Windows with a running MT5 terminal
+MetaTrader5>=5.0.45; sys_platform == "win32"
